@@ -1,0 +1,92 @@
+# Install, upgrade and remove the Windows MSI the ways administrators do (#5739): a chosen INSTALLFOLDER,
+# all users (ALLUSERS=1), upgrades from the last release in both scopes, the launch conditions that refuse
+# a second copy in the other scope, and a clean uninstall. The package under test is this checkout's WiX
+# sources with plain-text payloads (no Rust build); the previous one is the last release's x64 MSI.
+# Shaped as a craft-common-actions reusable workflow; the scripts would sit beside the shared installer
+# policy checker (storytold/craft-common-actions#136).
+name: Windows install paths
+
+on:
+  workflow_call:
+    inputs:
+      packaging-directory:
+        description: App packaging directory containing install-policy.json and WiX sources
+        type: string
+        required: false
+        default: packaging/windows
+      release-repository:
+        description: Repository whose latest release supplies the previous MSI (empty is this repository)
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  install-paths:
+    name: Windows install paths (fixture MSI, no app build)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned packaging toolchain
+        shell: pwsh
+        env:
+          PACKAGING_DIRECTORY: ${{ inputs.packaging-directory }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tools = Join-Path $env:RUNNER_TEMP 'craft-install-paths-wix'
+          dotnet tool install --tool-path $tools wix --version 5.0.2
+          if ($LASTEXITCODE -ne 0) { throw 'WiX installation failed.' }
+          $tools >> $env:GITHUB_PATH
+          $policy = Get-Content -Raw -LiteralPath (Join-Path $env:PACKAGING_DIRECTORY 'install-policy.json') | ConvertFrom-Json
+          foreach ($extension in @($policy.extensions)) {
+            if ($extension -notmatch '^[A-Za-z][A-Za-z0-9]*$') { throw "Invalid WiX extension: $extension" }
+            & (Join-Path $tools 'wix.exe') extension add -g "WixToolset.$extension.wixext/5.0.2"
+            if ($LASTEXITCODE -ne 0) { throw "WiX extension $extension installation failed." }
+          }
+      - name: Download the previous release's x64 MSI and check its SHA-256
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ inputs.release-repository || github.repository }}
+          PACKAGING_DIRECTORY: ${{ inputs.packaging-directory }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $id = (Get-Content -Raw -LiteralPath (Join-Path $env:PACKAGING_DIRECTORY 'install-policy.json') | ConvertFrom-Json).id
+          if ($id -notmatch '^[a-z][a-z0-9-]*$') { throw "Unexpected app id '$id'." }
+          $tag = gh release view --repo $env:RELEASE_REPOSITORY --json tagName --jq .tagName
+          if ($LASTEXITCODE -ne 0 -or -not $tag) { throw "No latest release in $env:RELEASE_REPOSITORY." }
+          $dir = Join-Path $env:RUNNER_TEMP 'craft-previous-release'
+          gh release download $tag --repo $env:RELEASE_REPOSITORY --dir $dir --pattern "$id-*-windows-x64.msi" --pattern SHA256SUMS.txt
+          if ($LASTEXITCODE -ne 0) { throw "Downloading $tag from $env:RELEASE_REPOSITORY failed." }
+          $msi = @(Get-ChildItem -LiteralPath $dir -Filter '*.msi')
+          if ($msi.Count -ne 1) { throw "Expected one x64 MSI in $tag, found $($msi.Count)." }
+          $listed = @(Get-Content -LiteralPath (Join-Path $dir 'SHA256SUMS.txt') | Where-Object { $_ -match "^([0-9a-fA-F]{64})\s+\*?$([regex]::Escape($msi[0].Name))$" } | ForEach-Object { $Matches[1] })
+          $actual = (Get-FileHash -LiteralPath $msi[0].FullName -Algorithm SHA256).Hash
+          if ($listed.Count -ne 1 -or $listed[0] -ne $actual) { throw "$($msi[0].Name): SHA-256 $actual does not match SHA256SUMS.txt." }
+          $signature = Get-AuthenticodeSignature -LiteralPath $msi[0].FullName
+          Write-Output "Previous release $tag : $($msi[0].Name) SHA-256 $actual, signature $($signature.Status) $($signature.SignerCertificate.Subject)"
+          "PREVIOUS_MSI=$($msi[0].FullName)" >> $env:GITHUB_ENV
+      - name: Install, upgrade and uninstall
+        shell: pwsh
+        env:
+          PACKAGING_DIRECTORY: ${{ inputs.packaging-directory }}
+        run: >-
+          & (Join-Path $env:PACKAGING_DIRECTORY 'test-install-paths.ps1')
+          -PackagingDirectory $env:PACKAGING_DIRECTORY
+          -OutputDirectory (Join-Path $env:RUNNER_TEMP 'craft-install-paths')
+          -PreviousMsi $env:PREVIOUS_MSI
+      - name: Keep the msiexec logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-install-paths-logs
+          path: |
+            ${{ runner.temp }}/craft-install-paths/summary.txt
+            ${{ runner.temp }}/craft-install-paths/logs/
+          if-no-files-found: warn
+          retention-days: 7
