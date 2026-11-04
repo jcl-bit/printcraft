@@ -1,0 +1,36 @@
+# Fork-only proof run for #5739; not for upstream. It calls the reusable workflow the way an app would call
+# it from craft-common-actions, and re-runs the fixture policy check that now shares build-fixture-msi.ps1.
+name: MSI install paths (proof)
+
+on:
+  push:
+    branches: ["ci/msi-install-paths*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install-paths:
+    uses: ./.github/workflows/windows-install-paths.yml
+    with:
+      release-repository: storytold/pdfcraft
+
+  windows-install-policy:
+    timeout-minutes: 10
+    name: Windows installation policy (no app build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned packaging toolchain
+        shell: pwsh
+        run: |
+          $tools = Join-Path $env:RUNNER_TEMP 'craft-install-policy-wix'
+          dotnet tool install --tool-path $tools wix --version 5.0.2
+          if ($LASTEXITCODE -ne 0) { throw 'WiX installation failed.' }
+          $tools >> $env:GITHUB_PATH
+      - name: Build and check non-executable installer fixtures
+        shell: pwsh
+        run: ./packaging/windows/test-install-policy.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'craft-install-policy-tests')
