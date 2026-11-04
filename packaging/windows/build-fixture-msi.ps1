@@ -20,7 +20,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $parts = @($Version.Split('.') | ForEach-Object { [int]$_ })
-if ($parts[0] -gt 255 -or $parts[1] -gt 255 -or $parts[2] -gt 65535) { throw "Version $Version is outside MSI's 255.255.65535." }
+# MSI allows a build field up to 65535; the compiler stamping the executables allows 65534.
+if ($parts[0] -gt 255 -or $parts[1] -gt 255 -or $parts[2] -gt 65534) { throw "Version $Version is outside 255.255.65534." }
 $packaging = (Resolve-Path -LiteralPath $PackagingDirectory).Path
 $root = (Resolve-Path -LiteralPath (Join-Path $packaging '..\..')).Path
 $policy = Get-Content -Raw -LiteralPath (Join-Path $packaging 'install-policy.json') | ConvertFrom-Json

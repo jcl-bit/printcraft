@@ -21,7 +21,8 @@
   says it should be: in the expected folder, in HKLM or HKCU for the scope, and nowhere in the other one.
   These are the Windows Sandbox checks used for #305 (App Paths, Open with, Default apps, the context menus,
   the shortcuts, the remembered InstallDir), read from the package's tables rather than written out for
-  one app. After every case the product is removed and a sweep must find nothing left: no product, file,
+  one app. Whether a conditional component (a context menu, the desktop shortcut) is installed at all is
+  logged, not judged; only its files, values and shortcuts are. After every case the product is removed and a sweep must find nothing left: no product, file,
   folder or registry line naming the app.
   Every step says which account runs msiexec. Only the runner's own account is implemented. A LocalSystem
   runner (#5879: Datto RMM and Intune install as SYSTEM) plugs into Invoke-Step; the product list and the
@@ -56,6 +57,7 @@ $Out = (Resolve-Path -LiteralPath $OutputDirectory).Path
 $LogDir = Join-Path $Out 'logs'
 [void](New-Item -ItemType Directory -Force -Path $LogDir)
 $Summary = Join-Path $Out 'summary.txt'
+if (Test-Path -LiteralPath $Summary) { Remove-Item -LiteralPath $Summary -Force } # one run per summary
 $script:Pass = 0
 $script:Fail = 0
 $SysProfile = Join-Path $env:WINDIR 'System32\config\systemprofile'
@@ -135,7 +137,8 @@ function Read-Package([string] $Path) {
     }
     $launch = @()
     if ($tables -contains 'LaunchCondition') {
-      $launch = @(Read-Rows $db 'SELECT `Description` FROM `LaunchCondition`' 1 | ForEach-Object { $_[0] })
+      $launch = @(Read-Rows $db 'SELECT `Condition`, `Description` FROM `LaunchCondition`' 2 | ForEach-Object {
+          [pscustomobject]@{ Condition = $_[0]; Message = $_[1] } })
     }
   } finally {
     [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($db)
@@ -144,7 +147,7 @@ function Read-Package([string] $Path) {
   $version = (@($props['ProductVersion'].Split('.'))[0..2]) -join '.'
   return [pscustomobject]@{ Path = (Resolve-Path -LiteralPath $Path).Path; ProductCode = $props['ProductCode']; UpgradeCode = $props['UpgradeCode']
     ProductName = $props['ProductName']; Version = $version; Template = $template; Dirs = $dirs; Components = $components
-    Files = $files; Registry = $registry; Shortcuts = $shortcuts; LaunchMessages = $launch }
+    Files = $files; Registry = $registry; Shortcuts = $shortcuts; LaunchConditions = $launch }
 }
 # The path of a directory below Anchor ('' for Anchor itself), or $null if it is not below it.
 function Get-SubPath($Package, [string] $Dir, [string] $Anchor) {
@@ -303,11 +306,16 @@ function Read-Log([string] $Path) {
 }
 function Invoke-Msiexec([string] $Name, [string[]] $Arguments) {
   $log = Join-Path $LogDir "$($Name -replace '[^A-Za-z0-9.-]+', '-').log"
-  $sw = [Diagnostics.Stopwatch]::StartNew()
-  $p = Start-Process -FilePath msiexec.exe -ArgumentList (@($Arguments) + @('/l*v', "`"$log`"")) -Wait -PassThru
-  $sw.Stop()
-  Note ('{0}: msiexec {1} -> exit {2} in {3:n0}s' -f $Name, ($Arguments -join ' '), $p.ExitCode, $sw.Elapsed.TotalSeconds)
-  return [pscustomobject]@{ Code = $p.ExitCode; Log = $log }
+  # 1618: another installation is in progress (a runner image's own MSI work, or the service still busy).
+  for ($try = 1; ; $try++) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $p = Start-Process -FilePath msiexec.exe -ArgumentList (@($Arguments) + @('/l*v', "`"$log`"")) -Wait -PassThru
+    $sw.Stop()
+    Note ('{0}: msiexec {1} -> exit {2} in {3:n0}s' -f $Name, ($Arguments -join ' '), $p.ExitCode, $sw.Elapsed.TotalSeconds)
+    if ($p.ExitCode -ne 1618 -or $try -ge 5) { return [pscustomobject]@{ Code = $p.ExitCode; Log = $log } }
+    Note "$Name`: another installation is in progress (1618), trying again in 20 s"
+    Start-Sleep -Seconds 20
+  }
 }
 # One install step. RunAs names the account msiexec runs as; 'runner' (this elevated session) is the only one
 # so far. A 'system' runner for #5879 goes here, and its products and leftovers are already looked for.
@@ -372,13 +380,18 @@ function Assert-Installed([string] $Tag, $Package, [string] $Scope, [string] $Fo
   foreach ($line in $bad | Select-Object -First 25) { Note "  $line" }
   Check "$Tag`: mismatches among $($counts.file) files, $($counts.value) registry values, $($counts.key) keys and $($counts.link) shortcuts, and in the $other scope" $bad.Count 0
 }
-function Assert-Refused([string] $Tag, $Result, $Package) {
+# Guard is a property the expected launch condition tests (install-policy.wxi: CRAFT_MACHINE_DIR refuses a
+# per-user copy over an all-users one, CRAFT_USER_DIR the reverse).
+function Assert-Refused([string] $Tag, $Result, $Package, [string] $Guard) {
   Check "$Tag`: exit code" $Result.Code 1603
   $text = Read-Log $Result.Log
   # Compare the text up to the first formatted [Property], which the log shows resolved.
-  $hits = @($Package.LaunchMessages | Where-Object { $prefix = ($_ -split '\[')[0].Trim(); $prefix.Length -ge 10 -and $text.Contains($prefix) })
-  Check "$Tag`: refused by one of the package's launch conditions" $hits.Count 1
-  if ($hits.Count) { Note "$Tag`: launch condition message: $($hits[0])" }
+  $hits = @($Package.LaunchConditions | Where-Object { $prefix = ($_.Message -split '\[')[0].Trim(); $prefix.Length -ge 10 -and $text.Contains($prefix) })
+  Check "$Tag`: launch condition messages in the log" $hits.Count 1
+  if ($hits.Count -eq 1) {
+    Note "$Tag`: launch condition message: $($hits[0].Message)"
+    Check "$Tag`: refused by the condition that tests $Guard" ($hits[0].Condition -match "\b$([regex]::Escape($Guard))\b") $true
+  }
 }
 # Registry lines and files naming the app anywhere an installation could leave them. MuiCache and similar
 # lines under "Local Settings" are Windows' own launch records: logged, not counted.
@@ -400,8 +413,9 @@ function Get-Leftovers([string] $Tag, [string[]] $Folders) {
     }
   }
   $global:LASTEXITCODE = 0
-  $paths = @($Folders) + @(
-    (Join-Path $env:LOCALAPPDATA "Programs\$Suite"), (Join-Path $env:ProgramW6432 $Suite), (Join-Path $SysProfile "AppData\Local\Programs\$Suite"))
+  # The app's own default folders, not the suite folder: another Craft app may share it.
+  $paths = @($Folders) + @((Join-Path $env:LOCALAPPDATA "Programs\$Suite\$AppName"), (Join-Path $env:ProgramW6432 "$Suite\$AppName"),
+    (Join-Path $SysProfile "AppData\Local\Programs\$Suite\$AppName"))
   foreach ($pkg in $Packages.Values) {
     foreach ($s in $pkg.Shortcuts) {
       foreach ($scope in @('user', 'machine')) { $d = Get-LinkFolder $s.Dir $scope; if ($d) { $paths += Join-Path $d "$($s.Name).lnk" } }
@@ -430,7 +444,7 @@ if ($prev.Template -notmatch '^x64;') { throw "$PreviousMsi is not an x64 packag
 if ($CurrentMsi) { $Packages['current'] = Read-Package $CurrentMsi }
 else {
   $v = @($prev.Version.Split('.') | ForEach-Object { [int]$_ })
-  if ($v[2] -ge 65535) { throw "No patch version above $($prev.Version)." }
+  if ($v[2] -ge 65534) { throw "No patch version above $($prev.Version) that the fixture builder can stamp." }
   $next = "$($v[0]).$($v[1]).$($v[2] + 1)"
   $built = @(& (Join-Path $PSScriptRoot 'build-fixture-msi.ps1') -PackagingDirectory $packaging -StageDirectory (Join-Path $Out 'fixture') `
       -Arch x64 -Version $next -DisplayVersion "$next-install-test" -MsiName "$($policy.id)-$next-install-test.msi")
@@ -450,9 +464,10 @@ $MachineChosen = Join-Path "$env:SystemDrive\" "$AppName Test M\"
 $U = @('ALLUSERS=2', 'MSIINSTALLPERUSER=1')
 $M = @('ALLUSERS=1')
 function Folder([string] $Path) { "INSTALLFOLDER=`"$Path`"" }
-# Each step runs one package with properties; a refused step (1603) must leave the state as it was.
-function Step([string] $Msi, [string[]] $Properties, [string] $Package, [string] $Scope, [string] $Folder, [switch] $Refused, [string[]] $Gone = @()) {
-  return @{ Msi = $Msi; Properties = $Properties; Package = $Package; Scope = $Scope; Folder = $Folder; Refused = [bool]$Refused; Gone = $Gone; RunAs = 'runner' }
+# Each step runs one package with properties. A step with RefusedBy must exit 1603 through the launch
+# condition that tests that property and leave the state as it was.
+function Step([string] $Msi, [string[]] $Properties, [string] $Package, [string] $Scope, [string] $Folder, [string] $RefusedBy = '', [string[]] $Gone = @()) {
+  return @{ Msi = $Msi; Properties = $Properties; Package = $Package; Scope = $Scope; Folder = $Folder; RefusedBy = $RefusedBy; Gone = $Gone; RunAs = 'runner' }
 }
 $Cases = @(
   @{ Id = 'user-chosen-folder'; Rows = '1'; Steps = @(
@@ -472,17 +487,21 @@ $Cases = @(
       (Step current ($U + (Folder $UserB)) current user $UserB -Gone $UserA)) }
   @{ Id = 'refused-over-machine'; Rows = '6, 7'; Steps = @(
       (Step previous $M previous machine $MachineDefault),
-      (Step current @() previous machine $MachineDefault -Refused),
-      (Step current $U previous machine $MachineDefault -Refused)) }
+      (Step current @() previous machine $MachineDefault -RefusedBy CRAFT_MACHINE_DIR),
+      (Step current $U previous machine $MachineDefault -RefusedBy CRAFT_MACHINE_DIR)) }
   @{ Id = 'refused-machine-over-user'; Rows = '8'; Steps = @(
       (Step previous $U previous user $UserDefault),
-      (Step current $M previous user $UserDefault -Refused)) }
+      (Step current $M previous user $UserDefault -RefusedBy CRAFT_USER_DIR)) }
 )
+$unknown = @($Only | Where-Object { $_ -notin @($Cases | ForEach-Object { $_.Id }) })
+if ($unknown.Count) { throw "Unknown case in -Only: $($unknown -join ', ')." }
 
 # ---------------------------------------------------------------- run
 Assert-Clean 'clean start' @($UserDefault, $MachineDefault, $UserA, $UserB, $MachineChosen)
+$ran = 0
 foreach ($case in $Cases) {
   if ($Only.Count -and $Only -notcontains $case.Id) { continue }
+  $ran++
   Note "---- $($case.Id) (#5739 rows $($case.Rows))"
   $folders = New-Object System.Collections.Generic.List[string]
   try {
@@ -492,7 +511,7 @@ foreach ($case in $Cases) {
       $tag = "$($case.Id) step $n"
       $folders.Add($s.Folder)
       $result = Invoke-Step $tag $Packages[$s.Msi] $s.Properties $s.RunAs
-      if ($s.Refused) { Assert-Refused $tag $result $Packages[$s.Msi] } else { Check "$tag`: exit code" $result.Code 0 }
+      if ($s.RefusedBy) { Assert-Refused $tag $result $Packages[$s.Msi] $s.RefusedBy } else { Check "$tag`: exit code" $result.Code 0 }
       Assert-Installed $tag $Packages[$s.Package] $s.Scope $s.Folder
       foreach ($g in $s.Gone) { Check "$tag`: old folder removed ($g)" (Test-Path -LiteralPath $g) $false }
     }
@@ -503,5 +522,6 @@ foreach ($case in $Cases) {
     Assert-Clean "$($case.Id) uninstall" $folders.ToArray()
   }
 }
-Note "DONE: $script:Pass passed, $script:Fail failed"
-if ($script:Fail -gt 0 -or $script:Pass -eq 0) { exit 1 }
+if ($ran -eq 0) { Add-Failure 'No case ran.' }
+Note "DONE: $ran cases, $script:Pass checks passed, $script:Fail failed"
+if ($script:Fail -gt 0) { exit 1 }
