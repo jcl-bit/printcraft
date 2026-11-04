@@ -39,7 +39,6 @@
   <SetProperty Id="INSTALLFOLDER" Action="CraftDefaultUserFolder" Value="[LocalAppDataFolder]Programs\ArtCraft\PdfCraft\" After="CraftDefaultMachineFolder" Sequence="ui" Condition="NOT INSTALLFOLDER AND ALLUSERS &lt;&gt; 1" />
   <?endif?>
   <SetProperty Id="INSTALLFOLDER" Action="CraftRestoreMachineFolder" Value="[CRAFT_MACHINE_DIR]" Before="CraftRestoreUserFolder" Sequence="both" Condition="NOT INSTALLFOLDER AND ALLUSERS = 1 AND CRAFT_MACHINE_DIR" />
-  <Launch Condition="Installed OR ALLUSERS &lt;&gt; 1 OR NOT CRAFT_USER_DIR" Message="This app is already installed for your account. Choose Only for me to update it, or uninstall that copy before changing who it is installed for." />
   <Launch Condition="Installed OR ALLUSERS = 1 OR NOT CRAFT_MACHINE_DIR" Message="This app is already installed for everyone. Choose Everyone to update it, or pass ALLUSERS=1 to msiexec. Uninstall that copy before changing who it is installed for." />
   <UI>
     <TextStyle Id="CraftScopeText" FaceName="Segoe UI" Size="9" />
