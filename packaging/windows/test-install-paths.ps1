@@ -7,7 +7,7 @@
   Two packages take part:
     previous  the last release's x64 MSI, downloaded and verified by the caller;
     current   this checkout's WiX sources built by build-fixture-msi.ps1 (the real tables, plain-text
-              payloads), one patch version above previous.
+              payloads), one patch version above previous; or CurrentMsi when given.
   Cases, numbered by the rows of the table in #5739:
     1  per-user install to a chosen INSTALLFOLDER
     2  all-users install (ALLUSERS=1) to the default folder
@@ -31,6 +31,8 @@ param(
   [Parameter(Mandatory = $true)] [string] $PackagingDirectory,
   [Parameter(Mandatory = $true)] [string] $OutputDirectory,
   [Parameter(Mandatory = $true)] [string] $PreviousMsi,
+  # A package to test instead of the fixture build, such as a release candidate. Must be newer than PreviousMsi.
+  [string] $CurrentMsi = '',
   [string[]] $Only = @()
 )
 $ErrorActionPreference = 'Stop'
@@ -61,7 +63,11 @@ $SysProfile = Join-Path $env:WINDIR 'System32\config\systemprofile'
 # ---------------------------------------------------------------- reporting
 function Note([string] $Text) {
   Write-Host $Text
-  Add-Content -LiteralPath $Summary -Value $Text -Encoding UTF8
+  # Something reading the file at the same moment (a log tail, an indexer) must not fail the run.
+  for ($try = 1; ; $try++) {
+    try { Add-Content -LiteralPath $Summary -Value $Text -Encoding UTF8; return }
+    catch [System.IO.IOException] { if ($try -ge 5) { throw }; Start-Sleep -Milliseconds 200 }
+  }
 }
 function Check([string] $What, $Actual, $Expected) {
   if ("$Actual" -ceq "$Expected") { $script:Pass++; Note "PASS $What (= $Actual)"; return }
@@ -421,12 +427,18 @@ $Packages['previous'] = Read-Package $PreviousMsi
 $prev = $Packages['previous']
 if ($prev.UpgradeCode.Trim('{}') -ne $policy.upgradeCode) { throw "$PreviousMsi is not $AppName (UpgradeCode $($prev.UpgradeCode))." }
 if ($prev.Template -notmatch '^x64;') { throw "$PreviousMsi is not an x64 package ($($prev.Template))." }
-$v = @($prev.Version.Split('.') | ForEach-Object { [int]$_ })
-if ($v[2] -ge 65535) { throw "No patch version above $($prev.Version)." }
-$next = "$($v[0]).$($v[1]).$($v[2] + 1)"
-$built = @(& (Join-Path $PSScriptRoot 'build-fixture-msi.ps1') -PackagingDirectory $packaging -StageDirectory (Join-Path $Out 'fixture') `
-    -Arch x64 -Version $next -DisplayVersion "$next-install-test" -MsiName "$($policy.id)-$next-install-test.msi")
-$Packages['current'] = Read-Package $built[-1]
+if ($CurrentMsi) { $Packages['current'] = Read-Package $CurrentMsi }
+else {
+  $v = @($prev.Version.Split('.') | ForEach-Object { [int]$_ })
+  if ($v[2] -ge 65535) { throw "No patch version above $($prev.Version)." }
+  $next = "$($v[0]).$($v[1]).$($v[2] + 1)"
+  $built = @(& (Join-Path $PSScriptRoot 'build-fixture-msi.ps1') -PackagingDirectory $packaging -StageDirectory (Join-Path $Out 'fixture') `
+      -Arch x64 -Version $next -DisplayVersion "$next-install-test" -MsiName "$($policy.id)-$next-install-test.msi")
+  $Packages['current'] = Read-Package $built[-1]
+}
+$cur = $Packages['current']
+if ($cur.UpgradeCode -ne $prev.UpgradeCode -or $cur.Template -notmatch '^x64;') { throw "$($cur.Path) is not the same x64 product as $PreviousMsi." }
+if ([version]$cur.Version -le [version]$prev.Version) { throw "$($cur.Path) ($($cur.Version)) is not newer than $PreviousMsi ($($prev.Version))." }
 foreach ($k in $Packages.Keys) { Note "package $k`: $($Packages[$k].ProductName) $($Packages[$k].Version) $($Packages[$k].ProductCode) $($Packages[$k].Path)" }
 if (@(Get-Products).Count) { throw "$AppName is already installed here. This script removes what it installs, so it will not start." }
 

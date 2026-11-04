@@ -4,7 +4,8 @@
 .DESCRIPTION
   No Rust build: the payloads, models, docs, bitmaps and licence are small text or blank fixtures,
   so the package exercises its own tables (folders, registry, scope, upgrade and launch conditions)
-  and nothing else. None of its "executables" can run. test-install-policy.ps1 only reads such a
+  and nothing else. None of its "executables" can run: they are empty class libraries whose only
+  content is a version resource. test-install-policy.ps1 only reads such a
   package; test-install-paths.ps1 installs one, on a disposable CI runner only.
   Writes the fixture files and the MSI into StageDirectory and returns the MSI's full path.
 #>
@@ -26,10 +27,28 @@ $policy = Get-Content -Raw -LiteralPath (Join-Path $packaging 'install-policy.js
 [void](New-Item -ItemType Directory -Force -Path $StageDirectory)
 $stage = (Resolve-Path -LiteralPath $StageDirectory).Path
 Add-Type -AssemblyName System.Drawing
+# Executables get a version resource carrying the fixture's version and nothing else: an empty class
+# library, which Windows will not start. Without one, an upgrade over a release keeps the release's
+# versioned exe as the component key path ("Action: Null"), and removing the release then deletes it.
+# The .NET Framework compiler that ships with Windows writes that resource; PowerShell 7's Add-Type does not.
+$csc = @('Framework64', 'Framework') | ForEach-Object { Join-Path $env:WINDIR "Microsoft.NET\$_\v4.0.30319\csc.exe" } |
+  Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if (-not $csc) { throw 'The .NET Framework 4 compiler (csc.exe) is needed to version the fixture executables.' }
+$stub = Join-Path $stage 'versioned-fixture.cs'
+$versioned = Join-Path $stage 'versioned-fixture.bin'
+Set-Content -LiteralPath $stub -Encoding Ascii -Value @(
+  "[assembly: System.Reflection.AssemblyFileVersion(`"$Version.0`")]"
+  "[assembly: System.Reflection.AssemblyVersion(`"$Version.0`")]"
+  'public static class NonExecutableMsiMetadataTestFixture {}')
+& $csc /nologo /target:library "/out:$versioned" $stub | Out-Host
+if ($LASTEXITCODE -ne 0) { throw "csc failed (exit $LASTEXITCODE)." }
+$stamped = [Diagnostics.FileVersionInfo]::GetVersionInfo($versioned).FileVersion
+if ($stamped -ne "$Version.0") { throw "The fixture executables carry version '$stamped', not $Version.0." }
 foreach ($name in $policy.payloads) {
   $destination = Join-Path $stage $name
   [void](New-Item -ItemType Directory -Force -Path ([IO.Path]::GetDirectoryName($destination)))
-  Set-Content -LiteralPath $destination -Encoding Ascii -Value 'NON-EXECUTABLE MSI METADATA TEST FIXTURE'
+  if ($name -match '\.(exe|dll)$') { Copy-Item -LiteralPath $versioned -Destination $destination -Force }
+  else { Set-Content -LiteralPath $destination -Encoding Ascii -Value 'NON-EXECUTABLE MSI METADATA TEST FIXTURE' }
 }
 foreach ($folder in @('docs','models','notices')) {
   $path = Join-Path $stage $folder
